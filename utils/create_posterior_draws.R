@@ -19,7 +19,7 @@ create_draws_df <- function(samples) {
   }
   
   levels(draws_df$name) <- agent_ids
-  colnames(multi_agent_draws) <- c("agent", "posterior_estimate", "bias")
+  colnames(draws_df) <- c("agent", "posterior_estimate", "bias")
   
   return (draws_df)
 }
