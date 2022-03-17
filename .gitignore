@@ -47,3 +47,8 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# Further files
+WSLS.exe
+WSLS_multiagent.exe
+random_bias.exe
