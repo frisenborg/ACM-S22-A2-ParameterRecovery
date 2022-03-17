@@ -1,0 +1,349 @@
+---
+title: "Assignment 2 - ACM-S22"
+output: html_notebook
+author: ""
+---
+
+# Description
+For this assignment, we implement an imperfect Win-Stay Lose-Shift (WSLS) model,
+simulate data and fit the model in Stan. Furthermore, parameter recovery is
+assessed and discussed.
+
+### Instructions:
+1. Simulate appropriate data (1 agent, 1 opponent, n trials)
+2. Code the model in Stan
+3. Fit the model
+4. Simulate a full range of data (n agents, t trials,
+possibly different opponents)
+5. Fit the model separately to each agent
+6. Assess parameter recovery
+7. Assess the importance of the amount of trials: does parameter recovery
+change with 10, 30, 50, 100, 1000 trials?  
+
+**Optional:** build the same model in brms, extract the Stan code from it
+using `(stancode(model))` and comment the lines of code that you recognize
+and understand.
+
+
+
+# Setup
+We rely on Stan using the `cmdstanr` R package.
+Furthermore, we import some utility functions such as agent definitions and functions for running simulations.
+
+The `utils/simulation.R` contains the `simulation()` function, which runs a single simulation and returns two vectors:
+
+* `random_face`, which represents the choices (heads/tails) of the random agent  
+* `WSLS_face`, which represents the choices (heads/tails) of the WSLS agent  
+
+The `utils/simulation_helper_functions.R` file contains the `WSLS_encoding()` function. This function encodes wins/losses and heads/tails into two new vectors (for use in the Stan model). The format for the function is:
+
+* `wins_face`: if (win & heads) then 1, if (win & tails) then -1, else 0  
+* `loss_face`: if (loss & heads) then -1, if (loss & tails) then 1, else 0  
+
+```{r Setup, message=FALSE}
+
+library(pacman)
+
+pacman::p_load(tidyverse,
+               here,
+               posterior,
+               cmdstanr,
+               brms,
+               ggridges)
+
+# Source external script for agent definitions
+# 1. The imperfect WSLS agent (main focus of analysis)
+# 2. A random-bias agent, representing the opponent
+source("utils/agents.R")
+source("utils/simulation.R")
+source("utils/simulation_helper_functions.R")
+source("utils/create_posterior_draws.R")
+
+```
+
+
+
+# Run the simulation with a single agent
+The Stan model is located at `stan_models/WSLS.stan`.
+
+```{r Single agent simulation}
+
+# Define parameters for the simulation
+trials          <- 120
+random_bias     <- .5
+WSLS_staybias   <- 0.8
+WSLS_leavebias  <- 0.5
+
+# Running the simulation
+single_agent_df <- simulation_to_df(
+  simulation(
+    trials, random_bias, WSLS_staybias, WSLS_leavebias))
+
+
+
+# -- Stan modeling --
+file <- file.path("stan_models\\WSLS.stan")
+single_agent_stan <- cmdstan_model(file, cpp_options = list(stan__threads = TRUE))
+
+data <- list(
+  trials    = trials,
+  face      = single_agent_df$WSLS_face,
+  loss_face = single_agent_df$loss_face,
+  wins_face = single_agent_df$wins_face)
+
+# The following command calls Stan with specific options.
+single_agent_samples <- single_agent_stan$sample(
+  data = data,
+  seed = 123,
+  chains = 2,
+  parallel_chains = 2,
+  threads_per_chain = 2,
+  iter_warmup = 1000,
+  iter_sampling = 2000,
+  refresh = 500,
+  max_treedepth = 20,
+  adapt_delta = 0.99,
+)
+
+single_agent_samples$summary()
+
+```
+
+
+
+# Run the simulation with multiple agents
+The Stan model is located at `stan_models/WSLS_multiagent.stan`.
+
+```{r Multi agent simulation}
+
+# Define parameters for the simulation
+trials          <- 100
+agents          <- 10
+random_bias     <- .55
+WSLS_staybias   <- 0.9
+WSLS_leavebias  <- 0.8
+
+# Prepare the data for multiple agents
+for (agent in seq(agents)) {
+  # Running a single simulation
+  single_sim_result <- simulation_to_df(
+    simulation(
+      trials, random_bias, WSLS_staybias, WSLS_leavebias), agent)
+  
+  # Conditional for creating 
+  if (agent == 1) {
+    multi_agent_df <- single_sim_result
+  } else {
+    multi_agent_df <- rbind(multi_agent_df, single_sim_result)
+  }
+  
+  # Cleanup environment
+  rm(single_sim_result, agent)
+}
+
+
+
+# -- Stan modeling --
+file <- file.path("stan_models\\WSLS_multiagent.stan")
+multi_agent_stan <- cmdstan_model(file, cpp_options = list(stan__threads = TRUE))
+
+data <- list(
+  trials    = trials,
+  agents    = agents,
+  face      = matrix(multi_agent_df$WSLS_face, nrow=trials, ncol=agents),
+  wins_face = matrix(multi_agent_df$wins_face, nrow=trials, ncol=agents),
+  loss_face = matrix(multi_agent_df$loss_face, nrow=trials, ncol=agents))
+
+# The following command calls Stan with specific options.
+multi_agent_samples <- multi_agent_stan$sample(
+  data = data,
+  seed = 123,
+  chains = 2,
+  parallel_chains = 2,
+  threads_per_chain = 2,
+  iter_warmup = 1000,
+  iter_sampling = 2000,
+  refresh = 500,
+  max_treedepth = 20,
+  adapt_delta = 0.99,
+)
+
+multi_agent_samples$summary()
+
+```
+
+
+
+# Assess parameter recovery
+We want to asses parameter recovery, that is, the ability of our model estimates to approach the actual parameters. Since we have defined the parameters ourselves, we can simulate varying number of trials and the influence on our estimates for the parameters.
+
+```{r Parameter recovery}
+
+multi_agent_draws <- create_draws_df(multi_agent_samples)
+
+# Plot a ridgeline plot for staybias probability estimates
+multi_agent_draws %>%
+  subset(bias == "staybias") %>%
+
+  ggplot(aes(x=value, y=name, fill=..y.., color="white")) +
+  geom_density_ridges(rel_min_height = 0.01) +
+  scale_fill_gradient(low="deepskyblue4", high="deepskyblue3") +
+  scale_color_manual(values = c("white")) + 
+  geom_vline(xintercept=WSLS_staybias, size=1.1, color="firebrick3", alpha=0.7) +
+  xlim(0, 1) +
+  
+  theme_ridges() + 
+  theme(legend.position = "none") +
+  labs(
+    title="Staybias posterior probability estimates",
+    x="Staybias posterior probability",
+    y="")
+
+ggsave("plots/multi_agent_staybias.jpg", width=7.29, height=4.5)
+
+
+# Plot a ridgeline plot for leavebias probability estimates
+multi_agent_draws %>%
+  subset(bias == "leavebias") %>%
+  
+  ggplot(aes(x=value, y=name, fill=..y.., color="white")) +
+  geom_density_ridges(rel_min_height = 0.01) +
+  scale_fill_gradient(low="seagreen4", high="seagreen3") +
+  scale_color_manual(values = c("white")) + 
+  geom_vline(xintercept=WSLS_leavebias, size=1.1, color="firebrick3", alpha=0.7) +
+  annotate("text", label="Actual Parameter Value", x=WSLS_leavebias-0.17, y=10.3) +
+  xlim(0, 1) +
+  
+  theme_ridges() + 
+  theme(legend.position = "none") +
+  labs(
+    title="Leavebias posterior probability estimates",
+    x="Leavebias posterior probability",
+    y="")
+
+ggsave("plots/multi_agent_leavebias.jpg", width=7.29, height=4.5)
+
+```
+
+
+
+```{r Parameter recovery across different trials}
+
+# Define parameters for the simulation
+trials_vector   <- c(10, 30, 50, 100, 1000)
+agents          <- 10
+random_bias     <- .55
+WSLS_staybias   <- 0.9
+WSLS_leavebias  <- 0.8
+
+# Stan model setup
+file <- file.path("models\\WSLS_multiagent.stan")
+multi_agent_stan <- cmdstan_model(file, cpp_options = list(stan__threads = TRUE))
+
+# Go through each number of trials and save posterior draws
+for (trials in trials_vector) {
+  # Prepare the data for multiple agents
+  for (agent in seq(agents)) {
+    # Running a single simulation
+    single_sim_result <- simulation_to_df(
+      simulation(
+        trials, random_bias, WSLS_staybias, WSLS_leavebias), agent)
+    
+    # Conditional for creating 
+    if (agent == 1) {
+      multi_agent_df <- single_sim_result
+    } else {
+      multi_agent_df <- rbind(multi_agent_df, single_sim_result)
+    }
+    
+    # Cleanup environment
+    rm(single_sim_result, agent)
+  }
+  
+  data <- list(
+    trials    = trials,
+    agents    = agents,
+    face      = matrix(multi_agent_df$WSLS_face, nrow=trials, ncol=agents),
+    wins_face = matrix(multi_agent_df$wins_face, nrow=trials, ncol=agents),
+    loss_face = matrix(multi_agent_df$loss_face, nrow=trials, ncol=agents))
+  
+  # The following command calls Stan with specific options.
+  multi_agent_samples <- multi_agent_stan$sample(
+    data = data,
+    seed = 123,
+    chains = 2,
+    parallel_chains = 2,
+    threads_per_chain = 2,
+    iter_warmup = 1000,
+    iter_sampling = 2000,
+    refresh = 500,
+    max_treedepth = 20,
+    adapt_delta = 0.99,
+  )
+  
+  # Get all the posterior samples, save to dataframe and convert to long format
+  multi_agent_draws <- create_draws_df(multi_agent_samples)
+  multi_agent_draws$trials <- trials
+  
+  # Combine in a dataframe
+  if (trials == trials_vector[1]) {
+    multi_trial_draws <- multi_agent_draws
+  } else {
+    multi_trial_draws <- rbind(multi_trial_draws, multi_agent_draws)
+  }
+  
+}
+
+# Setup factor ordering for trials
+multi_trial_draws$trials <- as.factor(multi_trial_draws$trials)
+levels(multi_trial_draws$trials) <- trials_vector # Or reverse: rev.default(trials_vector)
+
+
+multi_trial_draws %>%
+  subset(bias == "staybias") %>%
+  
+  ggplot(aes(x=value, y=trials, fill=..y.., color="white")) +
+  geom_density_ridges(rel_min_height = 0.01, scale=2.5) +
+  scale_fill_gradient(low="deepskyblue4", high="deepskyblue3") +
+  scale_color_manual(values = c("white")) + 
+  geom_vline(xintercept=WSLS_staybias, size=1.1, color="firebrick3", alpha=0.7) +
+  annotate("text", label="Actual Parameter Value", x=WSLS_staybias-0.17, y=7) +
+  xlim(0, 1) +
+  
+  theme_ridges() + 
+  theme(legend.position = "none") +
+  labs(
+    title="Staybias posterior probability estimates by number of trials",
+    x="Staybias posterior probability",
+    y="Number of Trials")
+
+ggsave("plots/multi_trial_staybias.jpg", width=7.29, height=4.5)
+
+
+# Plot a ridgeline plot for leavebias probability estimates
+multi_trial_draws %>%
+  subset(bias == "leavebias") %>%
+  
+  ggplot(aes(x=value, y=trials, fill=..y.., color="white")) +
+  geom_density_ridges(rel_min_height = 0.01, scale=2.5) +
+  scale_fill_gradient(low="seagreen4", high="seagreen3") +
+  scale_color_manual(values = c("white")) + 
+  geom_vline(xintercept=WSLS_leavebias, size=1.1, color="firebrick3", alpha=0.7) +
+  annotate("text", label="Actual Parameter Value", x=WSLS_leavebias-0.17, y=7) +
+  xlim(0, 1) +
+  
+  theme_ridges() + 
+  theme(legend.position = "none") +
+  labs(
+    title="Leavebias posterior probability estimates by number of trials",
+    x="Leavebias posterior probability",
+    y="Number of Trials")
+
+ggsave("plots/multi_trial_leavebias.jpg", width=7.29, height=4.5)
+
+```
+
+
+
+
+
